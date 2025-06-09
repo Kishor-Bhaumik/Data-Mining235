@@ -30,9 +30,9 @@ class Config:
     
     # QLoRA specific parameters
     use_qlora: bool = True
-    lora_r: int = 16
-    lora_alpha: int = 32
-    lora_dropout: float = 0.1
+    lora_r: int = 8
+    lora_alpha: int = 16
+    lora_dropout: float = 0.2
     target_modules: list = field(default_factory=lambda: ["query", "value"])  # Adjust based on your model
     load_in_4bit: bool = True
     bnb_4bit_use_double_quant: bool = True
@@ -44,10 +44,14 @@ class Config:
     test_percent_ai: float = 1
     test_percent_human: float = 1 
 
+    warmup_steps: int = 5  # Add warmup steps
+    use_scheduler: bool = True  # Enable learning rate scheduling
+
     max_length: int = 512
     batch_size: int = 128
     num_epochs: int = 10
-    learning_rate: float = 2e-4  # Slightly higher LR for LoRA
+    learning_rate: float = 5e-5  # Slightly higher LR for LoRA
+    weight_decay: float = 0.1 
     use_wandb: bool = True
     verbose: bool = True
     limit_cache: bool = False
@@ -193,7 +197,9 @@ class TextClassifier(pl.LightningModule):
                 lora_alpha=cfg.lora_alpha,
                 lora_dropout=cfg.lora_dropout,
                 target_modules=cfg.target_modules,
-                bias="none"
+                bias="none",
+                use_rslora=True,  # Use RSLoRA for better stability
+                init_lora_weights="gaussian"  # More stable initialization
             )
             
             # Apply LoRA to the model
@@ -229,7 +235,7 @@ class TextClassifier(pl.LightningModule):
         else:
             fpr = 0.0
             
-        self.log("train_loss", outputs.loss)
+        self.log("train_loss", outputs.loss, on_epoch=True)
         self.log("train_fpr", fpr)  # Fixed the space in "train _fpr"
         return outputs.loss
 
@@ -258,15 +264,46 @@ class TextClassifier(pl.LightningModule):
         self.log(f'test_{prefix}_fpr', fpr)
 
     def configure_optimizers(self):
-        # For QLoRA, you might want to use a different optimizer configuration
+        from transformers import get_linear_schedule_with_warmup
+        
         if self.cfg.use_qlora:
             # Only optimize the trainable parameters (LoRA adapters)
             trainable_params = [p for p in self.parameters() if p.requires_grad]
-            return torch.optim.AdamW(trainable_params, lr=self.cfg.learning_rate, weight_decay=0.01)
+            optimizer = torch.optim.AdamW(
+                trainable_params, 
+                lr=self.cfg.learning_rate, 
+                weight_decay=self.cfg.weight_decay,
+                eps=1e-8,
+                betas=(0.9, 0.999)  # More conservative beta values
+            )
         else:
-            return torch.optim.AdamW(self.parameters(), lr=self.cfg.learning_rate, weight_decay=0.01)
-
-
+            optimizer = torch.optim.AdamW(
+                self.parameters(), 
+                lr=self.cfg.learning_rate, 
+                weight_decay=self.cfg.weight_decay,
+                eps=1e-8,
+                betas=(0.9, 0.999)
+            )
+        if self.cfg.use_scheduler:
+            # Calculate total training steps
+            total_steps = self.trainer.estimated_stepping_batches
+            
+            scheduler = get_linear_schedule_with_warmup(
+                optimizer,
+                num_warmup_steps=self.cfg.warmup_steps,
+                num_training_steps=total_steps
+            )
+            
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {
+                    "scheduler": scheduler,
+                    "interval": "step",
+                    "frequency": 1,
+                },
+            }
+        
+        return optimizer
 # ------------------------------
 # Data Module
 # ------------------------------
@@ -299,8 +336,9 @@ def train_and_test(cfg: Config):
         max_epochs=cfg.num_epochs,
         accelerator='gpu', devices=cfg.gpus,
         logger=logger,
-        log_every_n_steps=1,
+        log_every_n_steps=10,
         precision=16 if cfg.use_qlora else 32,  # Use mixed precision for QLoRA
+        accumulate_grad_batches=2,
     )
 
     trainer.fit(model, dm)
